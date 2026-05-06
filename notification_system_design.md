@@ -324,3 +324,97 @@ WHERE student_id = $1
 ---
 
 ---
+# Stage 3
+
+## Query Analysis & Optimization
+
+### Original Query
+
+```sql
+SELECT * FROM notifications
+WHERE studentID = 1042 AND isRead = false
+ORDER BY createdAt ASC;
+```
+
+### Is This Query Accurate?
+
+**No — the query has several problems:**
+
+1. **Wrong table structure** — Based on the schema designed in Stage 2, per-student read state lives in `student_notifications`, not `notifications`. The `notifications` table has no `studentID` or `isRead` column.
+
+2. **Incorrect column names** — The columns should be `student_id` (UUID, not integer `1042`), `is_read`, and `created_at` using snake_case.
+
+3. **`SELECT *` is harmful** — Fetches all columns (including `metadata JSONB`) even when only `id`, `type`, `message`, `timestamp`, and `is_read` are needed, increasing memory and I/O.
+
+4. **`ORDER BY createdAt ASC`** — Fetching oldest-first means the user sees stale notifications first. Descending order (`DESC`) is the correct UX default.
+
+### Why Is It Slow?
+
+At 50,000 students and 5,000,000 notifications:
+- No index on `(student_id, is_read)` → full table scan of `student_notifications`.
+- `ORDER BY created_at ASC` without an index forces an in-memory sort of millions of rows.
+- `SELECT *` causes wide row fetches, bloating the query buffer.
+
+**Estimated computation cost without indexes:** O(N) where N = total rows in `student_notifications` ≈ tens of millions. Each query would take several seconds.
+
+### Should You Add Indexes on Every Column?
+
+**No.** Adding indexes on every column is harmful:
+
+- Every `INSERT`, `UPDATE`, and `DELETE` must also update all indexes, dramatically slowing writes.
+- For a mass-notify of 50,000 students, write throughput would collapse.
+- Indexes consume significant disk space.
+- The query planner may choose a suboptimal index if too many exist, leading to worse performance than no index at all.
+
+**The right approach** is to add targeted indexes only on columns that appear in `WHERE`, `JOIN ON`, and `ORDER BY` clauses of high-frequency queries (as shown in Stage 2).
+
+### Corrected Query
+
+```sql
+SELECT
+    n.id,
+    n.type,
+    n.message,
+    n.created_at   AS timestamp,
+    sn.is_read     AS "isRead"
+FROM notifications n
+JOIN student_notifications sn
+    ON n.id = sn.notification_id
+WHERE sn.student_id = '550e8400-e29b-41d4-a716-446655440000'  -- UUID, not integer
+  AND sn.is_read = FALSE
+ORDER BY n.created_at DESC
+LIMIT 20;
+```
+
+This query benefits from the partial index `idx_sn_student_unread` created in Stage 2:
+
+```sql
+CREATE INDEX idx_sn_student_unread
+    ON student_notifications (student_id, is_read)
+    WHERE is_read = FALSE;
+```
+
+### Query: Students Who Got a Placement Notification in the Last 7 Days
+
+```sql
+SELECT DISTINCT s.id, s.roll_no, s.email, s.name
+FROM students s
+JOIN student_notifications sn ON s.id = sn.student_id
+JOIN notifications n          ON n.id  = sn.notification_id
+WHERE n.type       = 'Placement'
+  AND n.created_at >= NOW() - INTERVAL '7 days'
+ORDER BY s.roll_no;
+```
+
+**Why `DISTINCT`?** A student may have received multiple placement notifications in 7 days. `DISTINCT` deduplications at the student level.
+
+**Supporting index:**
+
+```sql
+CREATE INDEX idx_notifications_type_created
+    ON notifications (type, created_at DESC);
+```
+
+---
+
+---
