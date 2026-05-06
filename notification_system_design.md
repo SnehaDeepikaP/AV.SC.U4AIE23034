@@ -509,3 +509,252 @@ Route all `SELECT` queries to a PostgreSQL read replica. Write queries (`UPDATE`
 ---
 
 ---
+
+# Stage 5
+
+## Bulk Notify Redesign
+
+### Original Pseudocode (Problematic)
+
+```
+function notify_all(student_ids: array, message: string):
+    for student_id in student_ids:
+        send_email(student_id, message)   # calls Email API
+        save_to_db(student_id, message)   # DB insert
+        push_to_app(student_id, message)  # real-time push
+```
+
+### Shortcomings
+
+1. **Sequential processing** — Iterates over 50,000 students one-by-one. At even 10 ms per student, this takes 500 seconds (~8 minutes). Completely unacceptable.
+
+2. **No error handling** — If `send_email` fails for student #200, the loop throws and all subsequent students receive nothing. The 200-student failure proves this.
+
+3. **Tight coupling** — Email, DB, and push are synchronous dependencies. A slow email API blocks all three for every student.
+
+4. **No idempotency** — If the server crashes midway, there is no way to know which students were already notified. Re-running sends duplicates.
+
+5. **Memory pressure** — Passing 50,000 `student_ids` as an in-memory array can exhaust heap on large deployments.
+
+6. **Should DB and email happen together?** — No. They are independent concerns with different failure modes. DB insert should happen atomically and immediately; email delivery is eventually consistent and can be retried.
+
+### Redesigned Architecture
+
+```
+                     ┌────────────────────┐
+                     │  HR triggers       │
+                     │  POST /notify-all  │
+                     └────────┬───────────┘
+                              │
+                    ┌─────────▼──────────┐
+                    │  API Handler        │
+                    │  1. Validate input  │
+                    │  2. Batch-insert    │
+                    │     notifications  │
+                    │     into DB        │
+                    │  3. Enqueue job    │
+                    │     to Bull/Redis  │
+                    │  4. Return 202     │
+                    └─────────┬──────────┘
+                              │
+            ┌─────────────────▼─────────────────┐
+            │         Message Queue              │
+            │    (Bull + Redis / Kafka)          │
+            └──────┬──────────────┬─────────────┘
+                   │              │
+        ┌──────────▼───┐   ┌──────▼──────────┐
+        │ Email Worker  │   │ Push Worker      │
+        │ (N instances) │   │ (N instances)    │
+        │               │   │                  │
+        │ Batch 500/job │   │ SSE / WebSocket  │
+        │ Retry on fail │   │ push per student │
+        │ DLQ on 3 fail │   └──────────────────┘
+        └───────────────┘
+```
+
+### Revised Pseudocode
+
+```typescript
+// API Handler — synchronous part
+async function notifyAll(studentIds: string[], message: string): Promise<void> {
+  // 1. Bulk insert notification record once
+  const notification = await db.notifications.create({ message, type: 'Placement' });
+
+  // 2. Bulk insert student_notifications rows in batches (avoid single huge INSERT)
+  const BATCH_SIZE = 1000;
+  for (let i = 0; i < studentIds.length; i += BATCH_SIZE) {
+    const batch = studentIds.slice(i, i + BATCH_SIZE);
+    await db.studentNotifications.bulkCreate(
+      batch.map(sid => ({ studentId: sid, notificationId: notification.id }))
+    );
+  }
+
+  // 3. Enqueue email jobs (do NOT await; fire and forget into queue)
+  await emailQueue.addBulk(
+    studentIds.map(sid => ({
+      name: 'send-notification-email',
+      data: { studentId: sid, notificationId: notification.id, message },
+      opts: { attempts: 3, backoff: { type: 'exponential', delay: 2000 } }
+    }))
+  );
+
+  // 4. Enqueue push jobs
+  await pushQueue.addBulk(
+    studentIds.map(sid => ({
+      name: 'push-notification',
+      data: { studentId: sid, notificationId: notification.id, message }
+    }))
+  );
+}
+
+// Email Worker — processes jobs from queue
+emailQueue.process('send-notification-email', 50 /* concurrency */, async (job) => {
+  const { studentId, notificationId, message } = job.data;
+  try {
+    await emailService.send(studentId, message);
+    await Log('backend', 'info', 'service', `Email sent to ${studentId} for notification ${notificationId}`);
+  } catch (err) {
+    await Log('backend', 'error', 'service', `Email failed for ${studentId}: ${err.message}`);
+    throw err; // Bull retries automatically
+  }
+});
+```
+
+### Key Design Decisions
+
+| Decision | Rationale |
+|----------|-----------|
+| DB insert happens synchronously in the API handler | Notifications must be persisted reliably before anything else; DB is the source of truth |
+| Email & push are enqueued asynchronously | Email APIs can be slow or fail; they must not block the critical path |
+| Batch inserts of 1000 rows | Avoids statement timeout and memory issues with 50,000-row INSERT |
+| 3 retries with exponential backoff | Transient email API failures are retried without human intervention |
+| Dead-letter queue (DLQ) | Students who still fail after 3 retries are logged for manual follow-up |
+| Idempotency key on notification | Re-running `notifyAll` with same notification ID skips already-sent emails |
+
+---
+
+---
+
+# Stage 6
+
+## Priority Inbox — Top-N Most Important Unread Notifications
+
+### Problem
+
+Display the top `n` most important unread notifications. Priority is determined by a combination of **type weight** (Placement > Result > Event) and **recency** (newer = higher priority).
+
+### Priority Scoring Formula
+
+```
+score = typeWeight * 1_000_000 + recencyScore
+```
+
+Where:
+- `typeWeight`: Placement = 3, Result = 2, Event = 1
+- `recencyScore`: milliseconds since Unix epoch (newer = larger number)
+
+This ensures a Placement notification always ranks above a Result, but among same-type notifications, the newest appears first.
+
+### Implementation (TypeScript)
+
+```typescript
+interface Notification {
+  id: string;
+  type: "Event" | "Result" | "Placement";
+  message: string;
+  timestamp: string; // ISO 8601
+  isRead: boolean;
+}
+
+const TYPE_WEIGHT: Record<Notification["type"], number> = {
+  Placement: 3,
+  Result: 2,
+  Event: 1,
+};
+
+/**
+ * Compute a numeric priority score for a notification.
+ * Higher score = higher priority.
+ *
+ * Score = typeWeight * 1_000_000_000_000 + timestampMs
+ * The large multiplier ensures type always dominates recency.
+ */
+function priorityScore(notification: Notification): number {
+  const typeWeight = TYPE_WEIGHT[notification.type];
+  const timestampMs = new Date(notification.timestamp).getTime();
+  return typeWeight * 1_000_000_000_000 + timestampMs;
+}
+
+/**
+ * Returns the top-N unread notifications sorted by priority.
+ * Uses a min-heap approach for efficiency with large datasets.
+ *
+ * Time Complexity:  O(N log n) where N = total notifications, n = topN
+ * Space Complexity: O(n)
+ */
+function getTopNPriorityNotifications(
+  notifications: Notification[],
+  topN: number
+): Notification[] {
+  const unread = notifications.filter((n) => !n.isRead);
+
+  // Min-heap: maintains the top-N highest scores
+  // Element: [score, notification]
+  type HeapEntry = [number, Notification];
+
+  const heap: HeapEntry[] = [];
+
+  const heapifyUp = (i: number) => {
+    while (i > 0) {
+      const parent = Math.floor((i - 1) / 2);
+      if (heap[parent][0] > heap[i][0]) break;
+      [heap[parent], heap[i]] = [heap[i], heap[parent]];
+      i = parent;
+    }
+  };
+
+  const heapifyDown = (i: number) => {
+    const n = heap.length;
+    while (true) {
+      let smallest = i;
+      const l = 2 * i + 1;
+      const r = 2 * i + 2;
+      if (l < n && heap[l][0] < heap[smallest][0]) smallest = l;
+      if (r < n && heap[r][0] < heap[smallest][0]) smallest = r;
+      if (smallest === i) break;
+      [heap[smallest], heap[i]] = [heap[i], heap[smallest]];
+      i = smallest;
+    }
+  };
+
+  for (const notification of unread) {
+    const score = priorityScore(notification);
+    if (heap.length < topN) {
+      heap.push([score, notification]);
+      heapifyUp(heap.length - 1);
+    } else if (score > heap[0][0]) {
+      heap[0] = [score, notification];
+      heapifyDown(0);
+    }
+  }
+
+  // Extract and sort descending by score
+  return heap
+    .sort((a, b) => b[0] - a[0])
+    .map(([, notification]) => notification);
+}
+```
+
+### Maintaining Top-N Efficiently as New Notifications Arrive
+
+The heap approach naturally handles new notifications: each new notification is evaluated against the current minimum in the heap (O(log n) operation). If it scores higher, it replaces the minimum. This makes the system efficient even with a continuous stream of incoming notifications.
+
+For a production implementation with SSE/WebSocket:
+
+1. On `notification.new` event, compute the new notification's score.
+2. If its score > minimum score in the current top-N display, insert it and evict the minimum.
+3. Re-render the priority inbox client-side — no full re-fetch needed.
+
+### Approach Description (for notification_system_design.md)
+
+The Priority Inbox ranks unread notifications using a **weighted scoring system** where notification type determines primary rank (Placement outranks Result outranks Event) and recency serves as a tiebreaker. A min-heap of size N processes the full notification list in O(total × log N) time, making it efficient even with thousands of notifications. As new notifications arrive in real-time, only an O(log N) heap comparison is needed to decide whether to evict the current minimum — no full re-sort is required.
