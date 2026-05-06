@@ -418,3 +418,94 @@ CREATE INDEX idx_notifications_type_created
 ---
 
 ---
+# Stage 4
+
+## Performance Strategy — Caching & Optimization
+
+### The Problem
+
+Notifications are fetched on every page load for every student. With 50,000 concurrent students, this is 50,000 database queries per page load cycle, overwhelming PostgreSQL.
+
+### Recommended Strategy: Multi-Layer Caching
+
+#### Layer 1 — Redis Cache (Primary Strategy)
+
+Cache per-student notification lists in Redis with a TTL.
+
+**Cache key design:**
+```
+notifications:{studentId}:page:{page}:limit:{limit}:type:{type|all}
+```
+
+**TTL:** 60 seconds for paginated lists; 30 seconds for unread count.
+
+**Invalidation trigger:** When a new notification is pushed to a student, delete all their cached keys using a Redis key pattern scan or a dedicated invalidation set.
+
+```typescript
+// On read (cache-aside pattern)
+const cacheKey = `notifications:${studentId}:page:${page}:limit:${limit}:type:${type}`;
+const cached = await redis.get(cacheKey);
+if (cached) return JSON.parse(cached);
+
+const data = await db.query(/* SQL */);
+await redis.setex(cacheKey, 60, JSON.stringify(data));
+return data;
+```
+
+**Tradeoff:** Students may see notifications up to 60 s stale. Acceptable for non-critical notifications; use SSE/WebSocket for real-time delivery alongside.
+
+#### Layer 2 — Cursor-Based Pagination (replaces OFFSET)
+
+Replace `LIMIT/OFFSET` with cursor pagination to avoid expensive skip-scans:
+
+```sql
+-- First page
+SELECT ... FROM notifications n
+JOIN student_notifications sn ON n.id = sn.notification_id
+WHERE sn.student_id = $1
+  AND sn.is_read = FALSE
+ORDER BY n.created_at DESC, n.id DESC
+LIMIT 20;
+
+-- Subsequent pages (cursor = last seen {created_at, id})
+SELECT ... FROM notifications n
+JOIN student_notifications sn ON n.id = sn.notification_id
+WHERE sn.student_id = $1
+  AND sn.is_read = FALSE
+  AND (n.created_at, n.id) < ($cursor_time, $cursor_id)  -- keyset
+ORDER BY n.created_at DESC, n.id DESC
+LIMIT 20;
+```
+
+This is O(1) regardless of page depth vs O(N) for OFFSET.
+
+#### Layer 3 — Materialized Unread Count
+
+Instead of `COUNT(*)` on every request:
+
+```sql
+CREATE TABLE student_notification_stats (
+    student_id   UUID PRIMARY KEY REFERENCES students(id),
+    unread_count INTEGER NOT NULL DEFAULT 0
+);
+```
+
+Increment on new notification, decrement on mark-as-read. The API returns `unreadCount` from this table without a COUNT query.
+
+#### Layer 4 — Read Replica
+
+Route all `SELECT` queries to a PostgreSQL read replica. Write queries (`UPDATE`, `INSERT`) go to the primary. This horizontally scales read capacity.
+
+### Strategy Tradeoffs
+
+| Strategy | Benefit | Tradeoff |
+|----------|---------|----------|
+| Redis cache | Near-zero DB reads for hot data | Stale data; cache invalidation complexity |
+| Cursor pagination | O(1) deep pagination | Clients can't jump to arbitrary page numbers |
+| Materialized count | O(1) unread count | Extra write on every notification update |
+| Read replica | Scales reads horizontally | Replication lag; replica may be slightly behind |
+| CDN (static assets) | Reduces FE load time | Only for static; not applicable to dynamic API |
+
+---
+
+---
